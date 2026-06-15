@@ -1,10 +1,301 @@
-courses = {}
+"""Course management system with instructors, enrollment history, reports, and search."""
 
-def add_course(course_id, name):
-    courses[course_id] = name
+import csv
+from datetime import date, datetime
+from pathlib import Path
+from typing import Any, Dict, List, Optional
 
-def list_courses():
-    return list(courses.values())
+courses: Dict[str, Dict[str, Any]] = {}
+enrollment_history: List[Dict[str, Any]] = []
 
-def course_count():
+
+class CourseManagementError(ValueError):
+    """Raised when course or enrollment data is invalid."""
+
+
+class CourseStorageError(RuntimeError):
+    """Raised when exporting course reports fails."""
+
+
+def _normalize_course_id(course_id: Any) -> str:
+    if course_id is None:
+        raise CourseManagementError("course_id is required")
+
+    normalized = str(course_id).strip()
+    if not normalized:
+        raise CourseManagementError("course_id cannot be empty")
+    return normalized
+
+
+def _normalize_name(name: Any, field_name: str = "name") -> str:
+    if name is None:
+        raise CourseManagementError(f"{field_name} is required")
+
+    normalized = str(name).strip()
+    if not normalized:
+        raise CourseManagementError(f"{field_name} cannot be empty")
+    return normalized
+
+
+def _normalize_capacity(capacity: Optional[Any]) -> Optional[int]:
+    if capacity is None:
+        return None
+
+    if isinstance(capacity, bool) or not isinstance(capacity, int):
+        raise CourseManagementError("capacity must be an integer")
+
+    if capacity <= 0:
+        raise CourseManagementError("capacity must be greater than 0")
+    return capacity
+
+
+def _normalize_date(value: Optional[Any]) -> date:
+    if value is None:
+        return date.today()
+
+    if isinstance(value, date) and not isinstance(value, datetime):
+        return value
+
+    if isinstance(value, datetime):
+        return value.date()
+
+    if isinstance(value, str):
+        try:
+            return datetime.strptime(value, "%Y-%m-%d").date()
+        except ValueError as exc:
+            raise CourseManagementError("date must be YYYY-MM-DD") from exc
+
+    raise CourseManagementError("date must be a date object or YYYY-MM-DD string")
+
+
+def _normalize_student_id(student_id: Any) -> str:
+    if student_id is None:
+        raise CourseManagementError("student_id is required")
+
+    normalized = str(student_id).strip()
+    if not normalized:
+        raise CourseManagementError("student_id cannot be empty")
+    return normalized
+
+
+def _normalize_optional_text(value: Any) -> str:
+    if value is None:
+        return ""
+    return str(value).strip()
+
+
+def _serialise_course(course: Dict[str, Any]) -> Dict[str, Any]:
+    students = [course["students"][student_id] for student_id in sorted(course["students"])]
+    enrolled_count = len(students)
+    available_seats = None if course["capacity"] is None else max(0, course["capacity"] - enrolled_count)
+    fill_rate = None
+    if course["capacity"] is not None:
+        fill_rate = round((enrolled_count / course["capacity"]) * 100, 2)
+
+    return {
+        "course_id": course["course_id"],
+        "name": course["name"],
+        "instructor": course["instructor"],
+        "capacity": course["capacity"],
+        "enrolled_count": enrolled_count,
+        "available_seats": available_seats,
+        "fill_rate": fill_rate,
+        "students": students,
+    }
+
+
+def _serialise_history_item(item: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        "course_id": item["course_id"],
+        "course_name": item["course_name"],
+        "student_id": item["student_id"],
+        "student_name": item["student_name"],
+        "action": item["action"],
+        "date": item["date"].isoformat(),
+    }
+
+
+def _get_course(course_id: Any) -> Dict[str, Any]:
+    normalized_course_id = _normalize_course_id(course_id)
+    course = courses.get(normalized_course_id)
+    if course is None:
+        raise CourseManagementError(f"course '{normalized_course_id}' does not exist")
+    return course
+
+
+def clear_data() -> None:
+    """Remove all courses and enrollment history."""
+    courses.clear()
+    enrollment_history.clear()
+
+
+def add_course(
+    course_id: Any,
+    name: Any,
+    instructor: Optional[Any] = None,
+    capacity: Optional[Any] = None,
+) -> Dict[str, Any]:
+    """Create or update a course."""
+    normalized_course_id = _normalize_course_id(course_id)
+    normalized_name = _normalize_name(name)
+    normalized_capacity = _normalize_capacity(capacity)
+    existing = courses.get(normalized_course_id)
+
+    if existing is None:
+        course = {
+            "course_id": normalized_course_id,
+            "name": normalized_name,
+            "instructor": _normalize_optional_text(instructor),
+            "capacity": normalized_capacity,
+            "students": {},
+        }
+    else:
+        course = existing
+        course["name"] = normalized_name
+        if instructor is not None:
+            course["instructor"] = _normalize_optional_text(instructor)
+        if normalized_capacity is not None:
+            if len(course["students"]) > normalized_capacity:
+                raise CourseManagementError("capacity cannot be lower than the current enrollment")
+            course["capacity"] = normalized_capacity
+
+    courses[normalized_course_id] = course
+    return _serialise_course(course)
+
+
+def list_courses() -> List[str]:
+    """Return course names, preserving the original public API."""
+    return [courses[course_id]["name"] for course_id in sorted(courses)]
+
+
+def list_course_details() -> List[Dict[str, Any]]:
+    """Return detailed course records."""
+    return [_serialise_course(courses[course_id]) for course_id in sorted(courses)]
+
+
+def course_count() -> int:
     return len(courses)
+
+
+def get_course(course_id: Any) -> Dict[str, Any]:
+    """Return one course with roster details."""
+    return _serialise_course(_get_course(course_id))
+
+
+def enroll_student(
+    course_id: Any,
+    student_id: Any,
+    student_name: Optional[Any] = None,
+    enrolled_on: Optional[Any] = None,
+) -> Dict[str, Any]:
+    """Enroll a student in a course and record the enrollment."""
+    course = _get_course(course_id)
+    normalized_student_id = _normalize_student_id(student_id)
+
+    if normalized_student_id in course["students"]:
+        raise CourseManagementError(f"student '{normalized_student_id}' is already enrolled in '{course['course_id']}'")
+
+    if course["capacity"] is not None and len(course["students"]) >= course["capacity"]:
+        raise CourseManagementError(f"course '{course['course_id']}' is full")
+
+    student_record = {
+        "student_id": normalized_student_id,
+        "student_name": _normalize_optional_text(student_name),
+        "enrolled_on": _normalize_date(enrolled_on),
+    }
+    course["students"][normalized_student_id] = student_record
+
+    history_item = {
+        "course_id": course["course_id"],
+        "course_name": course["name"],
+        "student_id": normalized_student_id,
+        "student_name": student_record["student_name"],
+        "action": "enrolled",
+        "date": student_record["enrolled_on"],
+    }
+    enrollment_history.append(history_item)
+    return {
+        "course": _serialise_course(course),
+        "enrollment": {
+            "student_id": student_record["student_id"],
+            "student_name": student_record["student_name"],
+            "enrolled_on": student_record["enrolled_on"].isoformat(),
+        },
+    }
+
+
+def get_enrollment_history(course_id: Optional[Any] = None) -> List[Dict[str, Any]]:
+    """Return enrollment history filtered by course if requested."""
+    normalized_course_id = None if course_id is None else _normalize_course_id(course_id)
+    history: List[Dict[str, Any]] = []
+
+    for item in enrollment_history:
+        if normalized_course_id is not None and item["course_id"] != normalized_course_id:
+            continue
+        history.append(_serialise_history_item(item))
+
+    return history
+
+
+def search_courses(query: Optional[Any] = None, instructor: Optional[Any] = None) -> List[Dict[str, Any]]:
+    """Search courses by course ID, name, or instructor."""
+    normalized_query = None if query is None else str(query).strip().lower()
+    normalized_instructor = None if instructor is None else str(instructor).strip().lower()
+
+    results: List[Dict[str, Any]] = []
+    for course in courses.values():
+        haystack = f"{course['course_id']} {course['name']} {course['instructor']}".lower()
+        if normalized_query and normalized_query not in haystack:
+            continue
+        if normalized_instructor and normalized_instructor not in course["instructor"].lower():
+            continue
+        results.append(_serialise_course(course))
+
+    return sorted(results, key=lambda item: item["course_id"])
+
+
+def generate_enrollment_report() -> Dict[str, Any]:
+    """Generate a report for all courses and enrollments."""
+    courses_report = list_course_details()
+    return {
+        "total_courses": len(courses_report),
+        "total_enrollments": sum(course["enrolled_count"] for course in courses_report),
+        "courses": courses_report,
+        "full_courses": [course for course in courses_report if course["capacity"] is not None and course["enrolled_count"] >= course["capacity"]],
+        "low_capacity_courses": [course for course in courses_report if course["capacity"] is not None and course["available_seats"] is not None and course["available_seats"] <= 2],
+    }
+
+
+def export_enrollment_report_csv(file_path: Any) -> str:
+    """Export the enrollment report to a CSV file."""
+    path = Path(file_path)
+
+    try:
+        if path.parent and not path.parent.exists():
+            path.parent.mkdir(parents=True, exist_ok=True)
+
+        with path.open("w", newline="", encoding="utf-8") as handle:
+            writer = csv.DictWriter(
+                handle,
+                fieldnames=["course_id", "name", "instructor", "capacity", "enrolled_count", "available_seats", "fill_rate"],
+            )
+            writer.writeheader()
+            for course in list_course_details():
+                writer.writerow(
+                    {
+                        "course_id": course["course_id"],
+                        "name": course["name"],
+                        "instructor": course["instructor"],
+                        "capacity": course["capacity"] if course["capacity"] is not None else "",
+                        "enrolled_count": course["enrolled_count"],
+                        "available_seats": course["available_seats"] if course["available_seats"] is not None else "",
+                        "fill_rate": course["fill_rate"] if course["fill_rate"] is not None else "",
+                    }
+                )
+    except OSError as exc:
+        raise CourseStorageError(f"unable to export CSV to {path}: {exc}") from exc
+
+    return str(path)
+
+
+export_csv = export_enrollment_report_csv

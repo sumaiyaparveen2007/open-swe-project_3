@@ -1,0 +1,10 @@
+courses = {}
+
+def add_course(course_id, name):
+    courses[course_id] = name
+
+def list_courses():
+    return list(courses.values())
+
+def course_count():
+    return len(courses)
